@@ -56,7 +56,6 @@ export interface BookInfo {
   hasAnnotations: boolean
   isOwned: boolean
   isSample: boolean
-  kindleSessionId: string
   lastPageReadData: {
     deviceName: string
     position: number
