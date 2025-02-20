@@ -85,20 +85,28 @@ export function isPromise<T, S>(obj: PromiseLike<T> | S): obj is PromiseLike<T> 
   return !!obj && (typeof obj === 'object' || typeof obj === 'function') && 'then' in obj && typeof obj.then === 'function';
 }
 
-export async function withDefer<T>(body: (defer: (exit: () => void | Promise<void>) => void) => T) {
-  const defferals: Array<() => void | Promise<void>> = []
-  const defer = (defferal: () => void | Promise<void>) => { defferals.push(defferal) }
-  try {
-    const r = body(defer)
-    return isPromise(r) ? await r : r
-  } finally {
+export async function withDefer<T>(body: (defer: (deferral: (err: any) => void | Promise<void>) => void) => T) {
+  const defferals: Array<(err: any) => void | Promise<void>> = []
+  const defer = (defferal: (err: any) => void | Promise<void>) => { defferals.push(defferal) }
+
+  const runDeferrals = async (err: any) => {
     for (let i = 1; i <= defferals.length; i++) {
-      const exit = defferals[defferals.length - i]!
+      const deferral = defferals[defferals.length - i]!
       try {
-        const res = exit()
+        const res = deferral(err)
         if (isPromise(res)) await res
       } catch { }
     }
+  }
+
+  try {
+    const r = body(defer)
+    const ret = isPromise(r) ? await r : r
+    await runDeferrals(null)
+    return ret
+  } catch (err) {
+    await runDeferrals(err)
+    throw err
   }
 }
 
@@ -124,7 +132,6 @@ export async function mayStat(filename: string) {
     else throw err
   }
 }
-
 
 export async function niceOpen(filename: string, flags: string = 'r') {
   try {

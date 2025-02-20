@@ -35,6 +35,9 @@ importers:
       node-id3:
         specifier: ^0.2.6
         version: 0.2.6
+      ollama:
+        specifier: ^0.5.13
+        version: 0.5.13
       ollama-ocr:
         specifier: ^0.0.2
         version: 0.0.2

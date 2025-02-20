@@ -4,7 +4,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 
 import { globby } from 'globby'
-import pMap from 'p-map'
+import { pMapIterable } from 'p-map'
 
 import {
   input,
@@ -13,13 +13,26 @@ import {
 import {
   assert,
   getEnv,
+  isPromise,
+  errCode,
   mayStat,
   niceOpen,
   withDefer,
 } from './utils'
 
 import { OpenAIClient } from 'openai-fetch'
-import { ollamaOCR, DEFAULT_OCR_SYSTEM_PROMPT } from 'ollama-ocr'
+
+import {
+  ollamaOCR,
+  DEFAULT_OCR_SYSTEM_PROMPT,
+  SUPPORTED_IMAGE_TYPES,
+} from 'ollama-ocr'
+const DEFAULT_OCR_MODEL = "llama3.2-vision"
+
+import {
+  default as ollama,
+  Ollama
+} from 'ollama'
 
 const LEGACY_PROMPT_1 = 'You will be given an image containing text. Read the text from the image and output it verbatim.\n\n' +
   'Do not include any additional text, descriptions, or punctuation. Ignore any embedded images. Do not use markdown.'
@@ -108,19 +121,145 @@ function makeOpenAITranscriber(spec?: string | {
   }
 }
 
+type TimeoutSpec = number | { timeout: number, name?: string } | { deadline: number, name?: string, now?: () => number }
+
+function withTimeout<V>(pv: Promise<V>, timeout: TimeoutSpec) {
+  const { ms, mess } = (() => {
+    let mess = 'timeout expired'
+    let ms = NaN
+    if (typeof timeout === 'number') {
+      ms = timeout
+    } else {
+      if ('deadline' in timeout) {
+        const { deadline, name, now = () => performance.now() } = timeout
+        mess = name ? `${name} deadline exceeded` : 'deadline exceeded'
+        ms = deadline - now()
+      } else {
+        const { timeout: to, name } = timeout
+        ms = to
+        if (name) mess = `${name} deadline exceeded`
+      }
+    }
+    return { ms, mess }
+  })()
+
+  return Promise.race([
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(mess)), ms)), // TODO error.code
+    pv])
+}
+
+async function* iterTimeout<V, R>(it: AsyncIterator<V, R>, timeout: TimeoutSpec | ((i: number) => TimeoutSpec)) {
+  if (typeof timeout !== 'function') {
+    const spec = timeout
+    timeout = _ => spec
+  }
+  let i = 0
+  do {
+    const res = await withTimeout(it.next(), timeout(i++))
+    if (res.done) return res.value
+    else yield res.value
+  } while (true)
+}
+
 function makeOllamaTranscriber(model?: string) {
-  if (!model) model = undefined
+  if (!model) model = DEFAULT_OCR_MODEL
+
   // TODO support custom prompt env hookup?
-  return async function transcribe(filePath: string) {
-    return ollamaOCR({
-      filePath,
-      model,
-      systemPrompt: DEFAULT_OCR_SYSTEM_PROMPT
+  const systemPrompt = DEFAULT_OCR_SYSTEM_PROMPT
+
+  // TODO provide option hookup and/or auto tune from past transcription performance:
+  // - the caller is probably going to be retrying transcription anyhow
+  // - so if we collect timing info within this transcriber, and maybe also get retry count passed in below
+  // - then we can do things like "double the deadline on subsequent retries upto some limit"
+  // - and "first attempt deadline is some statistic of past transcriptions; e.g. median"
+  const timeout = 30_000
+  const reqTimeout = 2_000 // TODO derive relative to timeout
+  const firstTimeout = 2_000 // TODO derive relative to timeout
+
+  return async (filePath: string) => {
+    const image = await (async () => {
+      const start = performance.now()
+      const r = await ollama.encodeImage(await fs.readFile(filePath))
+      const end = performance.now()
+      const took = end - start
+      console.warn('ollama encodeImage', { took, start, end, filePath })
+      return r
+    })()
+
+    // TODO eject this; make transcriber callers use a stream
+    const parts: string[] = []
+
+    await withDefer(async defer => {
+      let done_reason = '<undefined>'
+      let replies = 0
+      let first = NaN
+      let chatStart = NaN
+
+      const start = performance.now()
+      console.log('ollama transcribe', { start, filePath, model })
+      defer(err => {
+        const end = performance.now()
+        const took = end - start
+        if (err)
+          console.warn('ollama transcribe failed', { took, start, chatStart, first, replies, end, reason: done_reason, errCode: errCode(err), filePath, model })
+        else
+          console.log('ollama transcribe done', { took, start, chatStart, first, replies, end, reason: done_reason, filePath, model })
+      })
+
+      const reqDeadline = start + reqTimeout
+      const firstDeadline = start + reqTimeout + firstTimeout
+      const deadline = start + timeout
+
+      const res = await withTimeout(
+        ollama.chat({
+          model,
+          stream: true,
+          messages: [
+            {
+              role: 'user',
+              content: systemPrompt,
+              images: [image]
+            }
+          ]
+        }),
+        { name: 'chat request', deadline: reqDeadline })
+      defer(() => res.abort())
+
+      done_reason = '<not-done>'
+
+      // TODO next-message timeout how? what?
+      for await (const r of iterTimeout(
+        res[Symbol.asyncIterator](),
+        i => i === 0
+          ? { name: 'first chat reply', deadline: firstDeadline }
+          : { name: 'last chat reply', deadline: deadline }
+      )) {
+        if (!replies++) {
+          first = performance.now()
+          console.log('ollama transcribe first reply', { start, first, filePath, model })
+          // TODO update next-message timeout to be full
+        }
+
+        const { message: { role, content }, done, done_reason: dr } = r
+        if (role === 'assistant') parts.push(content)
+        else console.warn('ollama transcribe unknown reply', { role, content, filePath, model })
+
+        if (done) {
+          done_reason = dr || '<unknown>'
+          break
+        }
+      }
+
     })
+
+    return parts.join('')
   }
 }
 
 // TODO support markdown mode
+// TODO pivot -> TranscriberInto(inFile: string, outFile: string, metaFile?: string)
+// TODO or make the result a stream
 type Transcriber = (filename: string) => Promise<string>
 
 const makeTranscriberType: { [key: string]: (spec?: string) => Transcriber } = {
@@ -146,28 +285,44 @@ async function writeFile<T>(filename: string, withFile: (file: fs.FileHandle) =>
   })
 }
 
+const renameext = (fileName: string, ext: string) => path.join(
+  path.dirname(fileName),
+  `${path.basename(fileName, path.extname(fileName))}${ext}`)
+
 const pageImageExt = '.png'
 
 async function proc(pageFiles: AsyncIterable<string>) {
   const concurrency = parseInt(getEnv('TRANSCRIBE_CONC') || '1')
 
   const method = getEnv('TRANSCRIBER') || 'ollama'
-  const transcribe = makeTranscriber(method)
 
-  await pMap(pageFiles, async pageFile => {
+  // TODO layer retries over transcriber here ; pull out of openai implementation
+  const transcribe = makeTranscriber(method)
+  // TODO support transcriber close
+
+  let done = 0, fail = 0
+
+  for await (const { pageFile, ...res } of pMapIterable(pageFiles, async pageFile => {
     try {
-      const textFile = path.join(
-        path.dirname(pageFile),
-        `${path.basename(pageFile, pageImageExt)}.txt`)
-      console.log('transcribing', pageFile)
+      const textFile = renameext(pageFile, '.txt')
       const text = await transcribe(pageFile)
       await writeFile(textFile, file => file.writeFile(text))
-      console.log('saved', textFile)
-
+      return { pageFile, textFile }
     } catch (err) {
-      console.error(`error transcribing ${pageFile}`, err)
+      return { pageFile, err }
     }
-  }, { concurrency })
+  }, { concurrency })) {
+    if (res.err) {
+      console.error(`error transcribing ${pageFile}`, res.err)
+      fail++
+    } else {
+      const { textFile } = res
+      console.log('transcribed', { pageFile, textFile })
+      done++
+    }
+  }
+
+  console.log('proc', { done, fail })
 }
 
 async function main() {
@@ -195,9 +350,10 @@ async function main() {
     return { all: asinDir(arg) }
   }
 
-  const args = process.argv.slice(2)
-  if (args.length) {
-    await proc(async function*() {
+  await proc(async function*() {
+    const args = process.argv.slice(2)
+
+    if (args.length) {
       for (const arg of args) {
         const pa = await parseArg(arg)
         if (pa.one) {
@@ -206,15 +362,14 @@ async function main() {
           yield* await globby(`${pa.all}/*${pageImageExt}`)
         }
       }
-    }())
-  } else {
-    const asin = getEnv('ASIN') || await input({ message: 'ASIN?' })
-    assert(asin, 'ASIN is required')
-    return proc(async function*() {
+    } else {
+      const asin = getEnv('ASIN') || await input({ message: 'ASIN?' })
+      assert(asin, 'ASIN is required')
       const pageFiles = await globby(`${asinDir(asin)}/*${pageImageExt}`)
       yield* pageFiles
-    }())
-  }
+    }
+  }())
 }
 
 await main()
+console.log('main fin')
